@@ -346,13 +346,13 @@ message Pool {
   string not_bonded_tokens       = 1 [
     (cosmos_proto.scalar)  = "cosmos.Int",
     (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
-    (gogoproto.jsontag)    = "not_bonded_tokens",
-    (gogoproto.nullable)   = false
+    (gogoproto.nullable)   = false,
+    (gogoproto.jsontag)    = "not_bonded_tokens"
   ];
   string bonded_tokens = 2 [
     (cosmos_proto.scalar)  = "cosmos.Int",
-    (gogoproto.jsontag)    = "bonded_tokens",
     (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
-    (gogoproto.nullable)   = false
+    (gogoproto.nullable)   = false,
+    (gogoproto.jsontag)    = "bonded_tokens"
   ];
 }

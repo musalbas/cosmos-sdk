@@ -185,7 +185,7 @@ func (s *IntegrationTestSuite) TestGetCmdQueryTotalSupply() {
 					sdk.NewCoin(fmt.Sprintf("%stoken", val.Moniker), s.cfg.AccountTokens),
 					sdk.NewCoin(s.cfg.BondDenom, s.cfg.StakingTokens.Add(sdk.NewInt(10))),
 				),
-				Pagination: &query.PageResponse{Total: 2},
+				Pagination: &query.PageResponse{Total: 0},
 			},
 		},
 		{
@@ -413,6 +413,23 @@ func (s *IntegrationTestSuite) TestNewSendTxCmd() {
 				fmt.Sprintf("--%s=%s", flags.FlagFees, sdk.NewCoins(sdk.NewCoin(s.cfg.BondDenom, sdk.NewInt(10))).String()),
 			},
 			false, 0, &sdk.TxResponse{},
+		},
+		{
+			"chain-id shouldn't be used with offline and generate-only flags",
+			val.Address,
+			val.Address,
+			sdk.NewCoins(
+				sdk.NewCoin(fmt.Sprintf("%stoken", val.Moniker), sdk.NewInt(10)),
+				sdk.NewCoin(s.cfg.BondDenom, sdk.NewInt(10)),
+			),
+			[]string{
+				fmt.Sprintf("--%s=true", flags.FlagSkipConfirmation),
+				fmt.Sprintf("--%s=%s", flags.FlagBroadcastMode, flags.BroadcastSync),
+				fmt.Sprintf("--%s=%s", flags.FlagFees, sdk.NewCoins(sdk.NewCoin(s.cfg.BondDenom, sdk.NewInt(10))).String()),
+				fmt.Sprintf("--%s=true", flags.FlagOffline),
+				fmt.Sprintf("--%s=true", flags.FlagGenerateOnly),
+			},
+			true, 0, &sdk.TxResponse{},
 		},
 		{
 			"not enough fees",

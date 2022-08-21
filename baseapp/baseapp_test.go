@@ -2,6 +2,7 @@ package baseapp_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,22 +14,28 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/cosmos/cosmos-sdk/testutil/testdata_pulsar"
+
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/libs/log"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	dbm "github.com/tendermint/tm-db"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/codec"
+	"github.com/cosmos/cosmos-sdk/codec/legacy"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
+	dbm "github.com/cosmos/cosmos-sdk/db"
+	"github.com/cosmos/cosmos-sdk/db/memdb"
 	"github.com/cosmos/cosmos-sdk/simapp"
 	"github.com/cosmos/cosmos-sdk/snapshots"
 	snapshottypes "github.com/cosmos/cosmos-sdk/snapshots/types"
-	"github.com/cosmos/cosmos-sdk/store/rootmulti"
-	storetypes "github.com/cosmos/cosmos-sdk/store/types"
+	stypes "github.com/cosmos/cosmos-sdk/store/v2alpha1"
+	"github.com/cosmos/cosmos-sdk/store/v2alpha1/multi"
 	"github.com/cosmos/cosmos-sdk/testutil/testdata"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
@@ -49,7 +56,12 @@ func init() {
 }
 
 type paramStore struct {
-	db *dbm.MemDB
+	db *memdb.MemDB
+	rw dbm.DBReadWriter
+}
+
+func newParamStore(db *memdb.MemDB) *paramStore {
+	return &paramStore{db: db, rw: db.ReadWriter()}
 }
 
 func (ps *paramStore) Set(_ sdk.Context, key []byte, value interface{}) {
@@ -58,11 +70,11 @@ func (ps *paramStore) Set(_ sdk.Context, key []byte, value interface{}) {
 		panic(err)
 	}
 
-	ps.db.Set(key, bz)
+	ps.rw.Set(key, bz)
 }
 
 func (ps *paramStore) Has(_ sdk.Context, key []byte) bool {
-	ok, err := ps.db.Has(key)
+	ok, err := ps.rw.Has(key)
 	if err != nil {
 		panic(err)
 	}
@@ -71,7 +83,7 @@ func (ps *paramStore) Has(_ sdk.Context, key []byte) bool {
 }
 
 func (ps *paramStore) Get(_ sdk.Context, key []byte, ptr interface{}) {
-	bz, err := ps.db.Get(key)
+	bz, err := ps.rw.Get(key)
 	if err != nil {
 		panic(err)
 	}
@@ -90,9 +102,9 @@ func defaultLogger() log.Logger {
 	return logger.With("module", "sdk/app")
 }
 
-func newBaseApp(name string, options ...func(*baseapp.BaseApp)) *baseapp.BaseApp {
+func newBaseApp(name string, options ...baseapp.AppOption) *baseapp.BaseApp {
 	logger := defaultLogger()
-	db := dbm.NewMemDB()
+	db := memdb.NewDB()
 	codec := codec.NewLegacyAmino()
 	registerTestCodec(codec)
 	return baseapp.NewBaseApp(name, logger, db, options...)
@@ -101,10 +113,10 @@ func newBaseApp(name string, options ...func(*baseapp.BaseApp)) *baseapp.BaseApp
 func registerTestCodec(cdc *codec.LegacyAmino) {
 	// register test types
 	cdc.RegisterConcrete(&txTest{}, "cosmos-sdk/baseapp/txTest", nil)
-	cdc.RegisterConcrete(&msgCounter{}, "cosmos-sdk/baseapp/msgCounter", nil)
-	cdc.RegisterConcrete(&msgCounter2{}, "cosmos-sdk/baseapp/msgCounter2", nil)
-	cdc.RegisterConcrete(&msgKeyValue{}, "cosmos-sdk/baseapp/msgKeyValue", nil)
-	cdc.RegisterConcrete(&msgNoRoute{}, "cosmos-sdk/baseapp/msgNoRoute", nil)
+	legacy.RegisterAminoMsg(cdc, &msgCounter{}, "cosmos-sdk/baseapp/msgCounter")
+	legacy.RegisterAminoMsg(cdc, &msgCounter2{}, "cosmos-sdk/baseapp/msgCounter2")
+	legacy.RegisterAminoMsg(cdc, &msgKeyValue{}, "cosmos-sdk/baseapp/msgKeyValue")
+	legacy.RegisterAminoMsg(cdc, &msgNoRoute{}, "cosmos-sdk/baseapp/msgNoRoute")
 }
 
 // aminoTxEncoder creates a amino TxEncoder for testing purposes.
@@ -113,15 +125,15 @@ func aminoTxEncoder(cdc *codec.LegacyAmino) sdk.TxEncoder {
 }
 
 // simple one store baseapp
-func setupBaseApp(t *testing.T, options ...func(*baseapp.BaseApp)) *baseapp.BaseApp {
+func setupBaseApp(t *testing.T, options ...baseapp.AppOption) *baseapp.BaseApp {
+	options = append(options, baseapp.SetSubstores(capKey1, capKey2))
 	app := newBaseApp(t.Name(), options...)
 	require.Equal(t, t.Name(), app.Name())
 
-	app.MountStores(capKey1, capKey2)
-	app.SetParamStore(&paramStore{db: dbm.NewMemDB()})
+	app.SetParamStore(newParamStore(memdb.NewDB()))
 
 	// stores are mounted
-	err := app.LoadLatestVersion()
+	err := app.Init()
 	require.Nil(t, err)
 	return app
 }
@@ -136,19 +148,20 @@ func testTxHandler(options middleware.TxHandlerOptions, customTxHandlerMiddlewar
 		middleware.RecoveryTxMiddleware,
 		middleware.NewIndexEventsTxMiddleware(options.IndexEvents),
 		middleware.ValidateBasicMiddleware,
+		middleware.ConsumeBlockGasMiddleware,
 		CustomTxHandlerMiddleware(customTxHandlerMiddleware),
 	)
 }
 
 // simple one store baseapp with data and snapshots. Each tx is 1 MB in size (uncompressed).
-func setupBaseAppWithSnapshots(t *testing.T, blocks uint, blockTxs int, options ...func(*baseapp.BaseApp)) (*baseapp.BaseApp, func()) {
+func setupBaseAppWithSnapshots(t *testing.T, blocks uint, blockTxs int, options ...baseapp.AppOption) (*baseapp.BaseApp, func()) {
 	codec := codec.NewLegacyAmino()
 	registerTestCodec(codec)
-	routerOpt := func(bapp *baseapp.BaseApp) {
+	routerOpt := baseapp.AppOptionFunc(func(bapp *baseapp.BaseApp) {
 		legacyRouter := middleware.NewLegacyRouter()
 		legacyRouter.AddRoute(sdk.NewRoute(routeMsgKeyValue, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
 			kv := msg.(*msgKeyValue)
-			bapp.CMS().GetCommitKVStore(capKey2).Set(kv.Key, kv.Value)
+			bapp.Store().GetKVStore(capKey2).Set(kv.Key, kv.Value)
 			any, err := codectypes.NewAnyWithValue(msg)
 			if err != nil {
 				return nil, err
@@ -167,13 +180,13 @@ func setupBaseAppWithSnapshots(t *testing.T, blocks uint, blockTxs int, options 
 			func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) { return ctx, nil },
 		)
 		bapp.SetTxHandler(txHandler)
-	}
+	})
 
 	snapshotInterval := uint64(2)
 	snapshotTimeout := 1 * time.Minute
 	snapshotDir, err := os.MkdirTemp("", "baseapp")
 	require.NoError(t, err)
-	snapshotStore, err := snapshots.NewStore(dbm.NewMemDB(), snapshotDir)
+	snapshotStore, err := snapshots.NewStore(memdb.NewDB(), snapshotDir)
 	require.NoError(t, err)
 	teardown := func() {
 		os.RemoveAll(snapshotDir)
@@ -182,7 +195,6 @@ func setupBaseAppWithSnapshots(t *testing.T, blocks uint, blockTxs int, options 
 	app := setupBaseApp(t, append(options,
 		baseapp.SetSnapshotStore(snapshotStore),
 		baseapp.SetSnapshotInterval(snapshotInterval),
-		baseapp.SetPruning(sdk.PruningOptions{KeepEvery: 1}),
 		routerOpt)...)
 
 	app.InitChain(abci.RequestInitChain{})
@@ -233,26 +245,71 @@ func TestMountStores(t *testing.T) {
 	app := setupBaseApp(t)
 
 	// check both stores
-	store1 := app.CMS().GetCommitKVStore(capKey1)
+	store1 := app.Store().GetKVStore(capKey1)
 	require.NotNil(t, store1)
-	store2 := app.CMS().GetCommitKVStore(capKey2)
+	store2 := app.Store().GetKVStore(capKey2)
 	require.NotNil(t, store2)
+}
+
+type MockTxHandler struct {
+	T *testing.T
+}
+
+func (th MockTxHandler) CheckTx(goCtx context.Context, req tx.Request, checkReq tx.RequestCheckTx) (tx.Response, tx.ResponseCheckTx, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	require.NotNil(th.T, ctx.ConsensusParams())
+	return tx.Response{}, tx.ResponseCheckTx{}, nil
+}
+
+func (th MockTxHandler) DeliverTx(goCtx context.Context, req tx.Request) (tx.Response, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	require.NotNil(th.T, ctx.ConsensusParams())
+	return tx.Response{}, nil
+}
+
+func (th MockTxHandler) SimulateTx(goCtx context.Context, req tx.Request) (tx.Response, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	require.NotNil(th.T, ctx.ConsensusParams())
+	return tx.Response{}, nil
+}
+
+func TestConsensusParamsNotNil(t *testing.T) {
+	app := setupBaseApp(t, baseapp.AppOptionFunc(func(app *baseapp.BaseApp) {
+		app.SetBeginBlocker(func(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
+			require.NotNil(t, ctx.ConsensusParams())
+			return abci.ResponseBeginBlock{}
+		})
+	}), baseapp.AppOptionFunc(func(app *baseapp.BaseApp) {
+		app.SetEndBlocker(func(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
+			require.NotNil(t, ctx.ConsensusParams())
+			return abci.ResponseEndBlock{}
+		})
+	}), baseapp.AppOptionFunc(func(app *baseapp.BaseApp) {
+		app.SetTxHandler(MockTxHandler{T: t})
+	}))
+
+	header := tmproto.Header{Height: 1}
+	app.BeginBlock(abci.RequestBeginBlock{Header: header})
+	app.EndBlock(abci.RequestEndBlock{Height: header.Height})
+	app.CheckTx(abci.RequestCheckTx{})
+	app.DeliverTx(abci.RequestDeliverTx{})
+	app.Simulate([]byte{})
 }
 
 // Test that we can make commits and then reload old versions.
 // Test that LoadLatestVersion actually does.
 func TestLoadVersion(t *testing.T) {
 	logger := defaultLogger()
-	pruningOpt := baseapp.SetPruning(storetypes.PruneNothing)
-	db := dbm.NewMemDB()
+	pruningOpt := baseapp.SetPruning(stypes.PruneNothing)
+	db := memdb.NewDB()
 	name := t.Name()
 	app := baseapp.NewBaseApp(name, logger, db, pruningOpt)
 
 	// make a cap key and mount the store
-	err := app.LoadLatestVersion() // needed to make stores non-nil
+	err := app.Init() // needed to make stores non-nil
 	require.Nil(t, err)
 
-	emptyCommitID := storetypes.CommitID{}
+	emptyCommitID := stypes.CommitID{}
 
 	// fresh store has zero/empty last commit
 	lastHeight := app.LastBlockHeight()
@@ -263,127 +320,62 @@ func TestLoadVersion(t *testing.T) {
 	// execute a block, collect commit ID
 	header := tmproto.Header{Height: 1}
 	app.BeginBlock(abci.RequestBeginBlock{Header: header})
-	res := app.Commit()
-	commitID1 := storetypes.CommitID{Version: 1, Hash: res.Data}
+	_ = app.Commit()
 
 	// execute a block, collect commit ID
 	header = tmproto.Header{Height: 2}
 	app.BeginBlock(abci.RequestBeginBlock{Header: header})
-	res = app.Commit()
-	commitID2 := storetypes.CommitID{Version: 2, Hash: res.Data}
+	res := app.Commit()
+	commitID2 := stypes.CommitID{Version: 2, Hash: res.Data}
+	app.CloseStore()
 
-	// reload with LoadLatestVersion
+	// reload with latest version
 	app = baseapp.NewBaseApp(name, logger, db, pruningOpt)
-	app.MountStores()
-	err = app.LoadLatestVersion()
+	err = app.Init()
 	require.Nil(t, err)
-	testLoadVersionHelper(t, app, int64(2), commitID2)
-
-	// reload with LoadVersion, see if you can commit the same block and get
-	// the same result
-	app = baseapp.NewBaseApp(name, logger, db, pruningOpt)
-	err = app.LoadVersion(1)
-	require.Nil(t, err)
-	testLoadVersionHelper(t, app, int64(1), commitID1)
-	app.BeginBlock(abci.RequestBeginBlock{Header: header})
-	app.Commit()
 	testLoadVersionHelper(t, app, int64(2), commitID2)
 }
 
-func useDefaultLoader(app *baseapp.BaseApp) {
-	app.SetStoreLoader(baseapp.DefaultStoreLoader)
-}
-
-func initStore(t *testing.T, db dbm.DB, storeKey string, k, v []byte) {
-	rs := rootmulti.NewStore(db)
-	rs.SetPruning(storetypes.PruneNothing)
+func initStore(t *testing.T, db dbm.DBConnection, storeKey string, k, v []byte) {
 	key := sdk.NewKVStoreKey(storeKey)
-	rs.MountStoreWithDB(key, storetypes.StoreTypeIAVL, nil)
-	err := rs.LoadLatestVersion()
-	require.Nil(t, err)
+	opts := multi.DefaultStoreParams()
+	opts.Pruning = stypes.PruneNothing
+	require.NoError(t, opts.RegisterSubstore(key, stypes.StoreTypePersistent))
+	rs, err := multi.NewV1MultiStoreAsV2(db, opts)
+	require.NoError(t, err)
 	require.Equal(t, int64(0), rs.LastCommitID().Version)
 
 	// write some data in substore
-	kv, _ := rs.GetStore(key).(storetypes.KVStore)
+	kv := rs.GetKVStore(key)
 	require.NotNil(t, kv)
 	kv.Set(k, v)
 	commitID := rs.Commit()
 	require.Equal(t, int64(1), commitID.Version)
+	require.NoError(t, rs.Close())
 }
 
-func checkStore(t *testing.T, db dbm.DB, ver int64, storeKey string, k, v []byte) {
-	rs := rootmulti.NewStore(db)
-	rs.SetPruning(storetypes.PruneDefault)
+func checkStore(t *testing.T, db dbm.DBConnection, ver int64, storeKey string, k, v []byte) {
+	opts := multi.DefaultStoreParams()
+	opts.Pruning = stypes.PruneNothing
 	key := sdk.NewKVStoreKey(storeKey)
-	rs.MountStoreWithDB(key, storetypes.StoreTypeIAVL, nil)
-	err := rs.LoadLatestVersion()
-	require.Nil(t, err)
+	require.NoError(t, opts.RegisterSubstore(key, stypes.StoreTypePersistent))
+	rs, err := multi.NewV1MultiStoreAsV2(db, opts)
+	require.NoError(t, err)
 	require.Equal(t, ver, rs.LastCommitID().Version)
 
 	// query data in substore
-	kv, _ := rs.GetStore(key).(storetypes.KVStore)
+	kv := rs.GetKVStore(key)
 	require.NotNil(t, kv)
 	require.Equal(t, v, kv.Get(k))
-}
-
-// Test that we can make commits and then reload old versions.
-// Test that LoadLatestVersion actually does.
-func TestSetLoader(t *testing.T) {
-	cases := map[string]struct {
-		setLoader    func(*baseapp.BaseApp)
-		origStoreKey string
-		loadStoreKey string
-	}{
-		"don't set loader": {
-			origStoreKey: "foo",
-			loadStoreKey: "foo",
-		},
-		"default loader": {
-			setLoader:    useDefaultLoader,
-			origStoreKey: "foo",
-			loadStoreKey: "foo",
-		},
-	}
-
-	k := []byte("key")
-	v := []byte("value")
-
-	for name, tc := range cases {
-		tc := tc
-		t.Run(name, func(t *testing.T) {
-			// prepare a db with some data
-			db := dbm.NewMemDB()
-			initStore(t, db, tc.origStoreKey, k, v)
-
-			// load the app with the existing db
-			opts := []func(*baseapp.BaseApp){baseapp.SetPruning(storetypes.PruneNothing)}
-			if tc.setLoader != nil {
-				opts = append(opts, tc.setLoader)
-			}
-			app := baseapp.NewBaseApp(t.Name(), defaultLogger(), db, opts...)
-			app.MountStores(sdk.NewKVStoreKey(tc.loadStoreKey))
-			err := app.LoadLatestVersion()
-			require.Nil(t, err)
-
-			// "execute" one block
-			app.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: 2}})
-			res := app.Commit()
-			require.NotNil(t, res.Data)
-
-			// check db is properly updated
-			checkStore(t, db, 2, tc.loadStoreKey, k, v)
-			checkStore(t, db, 2, tc.loadStoreKey, []byte("foo"), nil)
-		})
-	}
+	require.NoError(t, rs.Close())
 }
 
 func TestVersionSetterGetter(t *testing.T) {
 	logger := defaultLogger()
-	pruningOpt := baseapp.SetPruning(storetypes.PruneDefault)
-	db := dbm.NewMemDB()
+	pruningOpt := baseapp.SetPruning(stypes.PruneDefault)
+	db := memdb.NewDB()
 	name := t.Name()
 	app := baseapp.NewBaseApp(name, logger, db, pruningOpt)
-
 	require.Equal(t, "", app.Version())
 	res := app.Query(abci.RequestQuery{Path: "app/version"})
 	require.True(t, res.IsOK())
@@ -397,58 +389,22 @@ func TestVersionSetterGetter(t *testing.T) {
 	require.Equal(t, versionString, string(res.Value))
 }
 
-func TestLoadVersionInvalid(t *testing.T) {
-	logger := log.NewNopLogger()
-	pruningOpt := baseapp.SetPruning(storetypes.PruneNothing)
-	db := dbm.NewMemDB()
-	name := t.Name()
-	app := baseapp.NewBaseApp(name, logger, db, pruningOpt)
-
-	err := app.LoadLatestVersion()
-	require.Nil(t, err)
-
-	// require error when loading an invalid version
-	err = app.LoadVersion(-1)
-	require.Error(t, err)
-
-	header := tmproto.Header{Height: 1}
-	app.BeginBlock(abci.RequestBeginBlock{Header: header})
-	res := app.Commit()
-	commitID1 := storetypes.CommitID{Version: 1, Hash: res.Data}
-
-	// create a new app with the stores mounted under the same cap key
-	app = baseapp.NewBaseApp(name, logger, db, pruningOpt)
-
-	// require we can load the latest version
-	err = app.LoadVersion(1)
-	require.Nil(t, err)
-	testLoadVersionHelper(t, app, int64(1), commitID1)
-
-	// require error when loading an invalid version
-	err = app.LoadVersion(2)
-	require.Error(t, err)
-}
-
 func TestLoadVersionPruning(t *testing.T) {
 	logger := log.NewNopLogger()
-	pruningOptions := storetypes.PruningOptions{
+	pruningOptions := stypes.PruningOptions{
 		KeepRecent: 2,
-		KeepEvery:  3,
 		Interval:   1,
 	}
 	pruningOpt := baseapp.SetPruning(pruningOptions)
-	db := dbm.NewMemDB()
+	schemaOpt := baseapp.SetSubstores(sdk.NewKVStoreKey("key1"))
+	db := memdb.NewDB()
 	name := t.Name()
-	app := baseapp.NewBaseApp(name, logger, db, pruningOpt)
+	app := baseapp.NewBaseApp(name, logger, db, pruningOpt, schemaOpt)
 
-	// make a cap key and mount the store
-	capKey := sdk.NewKVStoreKey("key1")
-	app.MountStores(capKey)
-
-	err := app.LoadLatestVersion() // needed to make stores non-nil
+	err := app.Init() // needed to make stores non-nil
 	require.Nil(t, err)
 
-	emptyCommitID := storetypes.CommitID{}
+	emptyCommitID := stypes.CommitID{}
 
 	// fresh store has zero/empty last commit
 	lastHeight := app.LastBlockHeight()
@@ -456,36 +412,38 @@ func TestLoadVersionPruning(t *testing.T) {
 	require.Equal(t, int64(0), lastHeight)
 	require.Equal(t, emptyCommitID, lastID)
 
-	var lastCommitID storetypes.CommitID
+	var lastCommitID stypes.CommitID
 
 	// Commit seven blocks, of which 7 (latest) is kept in addition to 6, 5
 	// (keep recent) and 3 (keep every).
 	for i := int64(1); i <= 7; i++ {
 		app.BeginBlock(abci.RequestBeginBlock{Header: tmproto.Header{Height: i}})
 		res := app.Commit()
-		lastCommitID = storetypes.CommitID{Version: i, Hash: res.Data}
+		lastCommitID = stypes.CommitID{Version: i, Hash: res.Data}
 	}
 
+	// TODO: behavior change -
+	// CacheMultiStoreWithVersion returned no error on missing version (?)
 	for _, v := range []int64{1, 2, 4} {
-		_, err = app.CMS().CacheMultiStoreWithVersion(v)
-		require.NoError(t, err)
+		_, err = app.Store().GetVersion(v)
+		require.NoError(t, err, "version=%v", v)
 	}
 
 	for _, v := range []int64{3, 5, 6, 7} {
-		_, err = app.CMS().CacheMultiStoreWithVersion(v)
-		require.NoError(t, err)
+		_, err = app.Store().GetVersion(v)
+		require.NoError(t, err, "version=%v", v)
 	}
+	require.NoError(t, app.CloseStore())
 
-	// reload with LoadLatestVersion, check it loads last version
-	app = baseapp.NewBaseApp(name, logger, db, pruningOpt)
-	app.MountStores(capKey)
+	// reload app, check it loads last version
+	app = baseapp.NewBaseApp(name, logger, db, pruningOpt, schemaOpt)
 
-	err = app.LoadLatestVersion()
+	err = app.Init()
 	require.Nil(t, err)
 	testLoadVersionHelper(t, app, int64(7), lastCommitID)
 }
 
-func testLoadVersionHelper(t *testing.T, app *baseapp.BaseApp, expectedHeight int64, expectedID storetypes.CommitID) {
+func testLoadVersionHelper(t *testing.T, app *baseapp.BaseApp, expectedHeight int64, expectedID stypes.CommitID) {
 	lastHeight := app.LastBlockHeight()
 	lastID := app.LastCommitID()
 	require.Equal(t, expectedHeight, lastHeight)
@@ -494,15 +452,13 @@ func testLoadVersionHelper(t *testing.T, app *baseapp.BaseApp, expectedHeight in
 
 func TestOptionFunction(t *testing.T) {
 	logger := defaultLogger()
-	db := dbm.NewMemDB()
+	db := memdb.NewDB()
 	bap := baseapp.NewBaseApp("starting name", logger, db, testChangeNameHelper("new name"))
-	require.Equal(t, bap.GetName(), "new name", "BaseApp should have had name changed via option function")
+	require.Equal(t, bap.Name(), "new name", "BaseApp should have had name changed via option function")
 }
 
-func testChangeNameHelper(name string) func(*baseapp.BaseApp) {
-	return func(bap *baseapp.BaseApp) {
-		bap.SetName(name)
-	}
+func testChangeNameHelper(name string) baseapp.AppOptionFunc {
+	return func(bap *baseapp.BaseApp) { bap.SetName(name) }
 }
 
 // Test that Info returns the latest committed state.
@@ -531,12 +487,6 @@ func TestBaseAppOptionSeal(t *testing.T) {
 	})
 	require.Panics(t, func() {
 		app.SetVersion("")
-	})
-	require.Panics(t, func() {
-		app.SetDB(nil)
-	})
-	require.Panics(t, func() {
-		app.SetCMS(nil)
 	})
 	require.Panics(t, func() {
 		app.SetInitChainer(nil)
@@ -571,12 +521,12 @@ func TestInitChainer(t *testing.T) {
 	name := t.Name()
 	// keep the db and logger ourselves so
 	// we can reload the same  app later
-	db := dbm.NewMemDB()
+	db := memdb.NewDB()
 	logger := defaultLogger()
-	app := baseapp.NewBaseApp(name, logger, db)
 	capKey := sdk.NewKVStoreKey("main")
 	capKey2 := sdk.NewKVStoreKey("key2")
-	app.MountStores(capKey, capKey2)
+	schemaOpt := baseapp.SetSubstores(capKey, capKey2)
+	app := baseapp.NewBaseApp(name, logger, db, schemaOpt)
 
 	// set a value in the store on init chain
 	key, value := []byte("hello"), []byte("goodbye")
@@ -594,13 +544,13 @@ func TestInitChainer(t *testing.T) {
 	// initChainer is nil - nothing happens
 	app.InitChain(abci.RequestInitChain{})
 	res := app.Query(query)
-	require.Equal(t, 0, len(res.Value))
+	require.Nil(t, res.Value)
 
 	// set initChainer and try again - should see the value
 	app.SetInitChainer(initChainer)
 
 	// stores are mounted and private members are set - sealing baseapp
-	err := app.LoadLatestVersion() // needed to make stores non-nil
+	err := app.Init()
 	require.Nil(t, err)
 	require.Equal(t, int64(0), app.LastBlockHeight())
 
@@ -624,14 +574,16 @@ func TestInitChainer(t *testing.T) {
 
 	app.Commit()
 	res = app.Query(query)
+	require.True(t, res.IsOK(), res.Log)
 	require.Equal(t, int64(1), app.LastBlockHeight())
 	require.Equal(t, value, res.Value)
+	require.NoError(t, app.CloseStore())
 
 	// reload app
-	app = baseapp.NewBaseApp(name, logger, db)
+	app = baseapp.NewBaseApp(name, logger, db, schemaOpt)
 	app.SetInitChainer(initChainer)
-	app.MountStores(capKey, capKey2)
-	err = app.LoadLatestVersion() // needed to make stores non-nil
+
+	err = app.Init()
 	require.Nil(t, err)
 	require.Equal(t, int64(1), app.LastBlockHeight())
 
@@ -650,7 +602,7 @@ func TestInitChainer(t *testing.T) {
 
 func TestInitChain_WithInitialHeight(t *testing.T) {
 	name := t.Name()
-	db := dbm.NewMemDB()
+	db := memdb.NewDB()
 	logger := defaultLogger()
 	app := baseapp.NewBaseApp(name, logger, db)
 
@@ -666,7 +618,7 @@ func TestInitChain_WithInitialHeight(t *testing.T) {
 
 func TestBeginBlock_WithInitialHeight(t *testing.T) {
 	name := t.Name()
-	db := dbm.NewMemDB()
+	db := memdb.NewDB()
 	logger := defaultLogger()
 	app := baseapp.NewBaseApp(name, logger, db)
 
@@ -837,7 +789,7 @@ func testTxDecoder(cdc *codec.LegacyAmino) sdk.TxDecoder {
 	}
 }
 
-func customHandlerTxTest(t *testing.T, capKey storetypes.StoreKey, storeKey []byte) handlerFun {
+func customHandlerTxTest(t *testing.T, capKey stypes.StoreKey, storeKey []byte) handlerFun {
 	return func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) {
 		store := ctx.KVStore(capKey)
 		txTest := tx.(txTest)
@@ -868,7 +820,7 @@ func counterEvent(evType string, msgCount int64) sdk.Events {
 	}
 }
 
-func handlerMsgCounter(t *testing.T, capKey storetypes.StoreKey, deliverKey []byte) sdk.Handler {
+func handlerMsgCounter(t *testing.T, capKey stypes.StoreKey, deliverKey []byte) sdk.Handler {
 	return func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
 		ctx = ctx.WithEventManager(sdk.NewEventManager())
 		store := ctx.KVStore(capKey)
@@ -948,7 +900,7 @@ func TestCheckTx(t *testing.T) {
 	// This ensures changes to the kvstore persist across successive CheckTx.
 	counterKey := []byte("counter-key")
 
-	txHandlerOpt := func(bapp *baseapp.BaseApp) {
+	txHandlerOpt := baseapp.AppOptionFunc(func(bapp *baseapp.BaseApp) {
 		legacyRouter := middleware.NewLegacyRouter()
 		// TODO: can remove this once CheckTx doesnt process msgs.
 		legacyRouter.AddRoute(sdk.NewRoute(routeMsgCounter, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
@@ -963,7 +915,7 @@ func TestCheckTx(t *testing.T) {
 			customHandlerTxTest(t, capKey1, counterKey),
 		)
 		bapp.SetTxHandler(txHandler)
-	}
+	})
 
 	app := setupBaseApp(t, txHandlerOpt)
 
@@ -1007,8 +959,7 @@ func TestDeliverTx(t *testing.T) {
 	anteKey := []byte("ante-key")
 	// test increments in the handler
 	deliverKey := []byte("deliver-key")
-
-	txHandlerOpt := func(bapp *baseapp.BaseApp) {
+	txHandlerOpt := baseapp.AppOptionFunc(func(bapp *baseapp.BaseApp) {
 		legacyRouter := middleware.NewLegacyRouter()
 		r := sdk.NewRoute(routeMsgCounter, handlerMsgCounter(t, capKey1, deliverKey))
 		legacyRouter.AddRoute(r)
@@ -1021,7 +972,7 @@ func TestDeliverTx(t *testing.T) {
 			customHandlerTxTest(t, capKey1, anteKey),
 		)
 		bapp.SetTxHandler(txHandler)
-	}
+	})
 	app := setupBaseApp(t, txHandlerOpt)
 	app.InitChain(abci.RequestInitChain{})
 
@@ -1082,7 +1033,7 @@ func TestMultiMsgDeliverTx(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	// run a multi-msg tx
 	// with all msgs the same route
@@ -1167,7 +1118,7 @@ func TestSimulateTx(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	app.InitChain(abci.RequestInitChain{})
 
@@ -1241,7 +1192,7 @@ func TestRunInvalidTransaction(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	header := tmproto.Header{Height: 1}
 	app.BeginBlock(abci.RequestBeginBlock{Header: header})
@@ -1320,7 +1271,7 @@ func TestRunInvalidTransaction(t *testing.T) {
 		newCdc := codec.NewLegacyAmino()
 		sdk.RegisterLegacyAminoCodec(newCdc) // register Tx, Msg
 		registerTestCodec(newCdc)
-		newCdc.RegisterConcrete(&msgNoDecode{}, "cosmos-sdk/baseapp/msgNoDecode", nil)
+		legacy.RegisterAminoMsg(newCdc, &msgNoDecode{}, "cosmos-sdk/baseapp/msgNoDecode")
 
 		txBytes, err := newCdc.Marshal(tx)
 		require.NoError(t, err)
@@ -1367,7 +1318,7 @@ func TestTxGasLimits(t *testing.T) {
 
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	header := tmproto.Header{Height: 1}
 	app.BeginBlock(abci.RequestBeginBlock{Header: header})
@@ -1454,7 +1405,7 @@ func TestMaxBlockGasLimits(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	app.InitChain(abci.RequestInitChain{
 		ConsensusParams: &tmproto.ConsensusParams{
@@ -1540,7 +1491,7 @@ func TestBaseAppMiddleware(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	app.InitChain(abci.RequestInitChain{})
 
@@ -1631,7 +1582,7 @@ func TestGasConsumptionBadTx(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	app.InitChain(abci.RequestInitChain{
 		ConsensusParams: &tmproto.ConsensusParams{
@@ -1697,7 +1648,7 @@ func TestQuery(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 
 	app.InitChain(abci.RequestInitChain{})
 
@@ -1745,7 +1696,8 @@ func TestGRPCQuery(t *testing.T) {
 		)
 	}
 
-	app := setupBaseApp(t, grpcQueryOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(grpcQueryOpt))
+	app.GRPCQueryRouter().SetInterfaceRegistry(codectypes.NewInterfaceRegistry())
 
 	app.InitChain(abci.RequestInitChain{})
 	header := tmproto.Header{Height: app.LastBlockHeight() + 1}
@@ -1771,6 +1723,41 @@ func TestGRPCQuery(t *testing.T) {
 	require.Equal(t, "Hello foo!", res.Greeting)
 }
 
+func TestGRPCQueryPulsar(t *testing.T) {
+	grpcQueryOpt := func(bapp *baseapp.BaseApp) {
+		testdata_pulsar.RegisterQueryServer(
+			bapp.GRPCQueryRouter(),
+			testdata_pulsar.QueryImpl{},
+		)
+	}
+
+	app := setupBaseApp(t, baseapp.AppOptionFunc(grpcQueryOpt))
+	app.GRPCQueryRouter().SetInterfaceRegistry(codectypes.NewInterfaceRegistry())
+
+	app.InitChain(abci.RequestInitChain{})
+	header := tmproto.Header{Height: app.LastBlockHeight() + 1}
+	app.BeginBlock(abci.RequestBeginBlock{Header: header})
+	app.Commit()
+
+	req := &testdata_pulsar.SayHelloRequest{Name: "foo"}
+	reqBz, err := proto.Marshal(req)
+	require.NoError(t, err)
+
+	reqQuery := abci.RequestQuery{
+		Data: reqBz,
+		Path: "/testdata.Query/SayHello",
+	}
+
+	resQuery := app.Query(reqQuery)
+
+	require.Equal(t, abci.CodeTypeOK, resQuery.Code, resQuery)
+
+	var res testdata_pulsar.SayHelloResponse
+	err = proto.Unmarshal(resQuery.Value, &res)
+	require.NoError(t, err)
+	require.Equal(t, "Hello foo!", res.Greeting)
+}
+
 // Test p2p filter queries
 func TestP2PQuery(t *testing.T) {
 	addrPeerFilterOpt := func(bapp *baseapp.BaseApp) {
@@ -1787,7 +1774,7 @@ func TestP2PQuery(t *testing.T) {
 		})
 	}
 
-	app := setupBaseApp(t, addrPeerFilterOpt, idPeerFilterOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(addrPeerFilterOpt), baseapp.AppOptionFunc(idPeerFilterOpt))
 
 	addrQuery := abci.RequestQuery{
 		Path: "/p2p/filter/addr/1.1.1.1:8000",
@@ -1821,6 +1808,8 @@ func TestGetMaximumBlockGas(t *testing.T) {
 }
 
 func TestListSnapshots(t *testing.T) {
+	t.Skip("disabled pending MultiStore snapshot implementation")
+
 	app, teardown := setupBaseAppWithSnapshots(t, 5, 4)
 	defer teardown()
 
@@ -1832,12 +1821,14 @@ func TestListSnapshots(t *testing.T) {
 		s.Metadata = nil
 	}
 	assert.Equal(t, abci.ResponseListSnapshots{Snapshots: []*abci.Snapshot{
-		{Height: 4, Format: 1, Chunks: 2},
-		{Height: 2, Format: 1, Chunks: 1},
+		{Height: 4, Format: snapshottypes.CurrentFormat, Chunks: 2},
+		{Height: 2, Format: snapshottypes.CurrentFormat, Chunks: 1},
 	}}, resp)
 }
 
 func TestLoadSnapshotChunk(t *testing.T) {
+	t.Skip("disabled pending MultiStore snapshot implementation")
+
 	app, teardown := setupBaseAppWithSnapshots(t, 2, 5)
 	defer teardown()
 
@@ -1847,13 +1838,13 @@ func TestLoadSnapshotChunk(t *testing.T) {
 		chunk       uint32
 		expectEmpty bool
 	}{
-		"Existing snapshot": {2, 1, 1, false},
-		"Missing height":    {100, 1, 1, true},
-		"Missing format":    {2, 2, 1, true},
-		"Missing chunk":     {2, 1, 9, true},
-		"Zero height":       {0, 1, 1, true},
+		"Existing snapshot": {2, snapshottypes.CurrentFormat, 1, false},
+		"Missing height":    {100, snapshottypes.CurrentFormat, 1, true},
+		"Missing format":    {2, 3, 1, true},
+		"Missing chunk":     {2, snapshottypes.CurrentFormat, 9, true},
+		"Zero height":       {0, snapshottypes.CurrentFormat, 1, true},
 		"Zero format":       {2, 0, 1, true},
-		"Zero chunk":        {2, 1, 0, false},
+		"Zero chunk":        {2, snapshottypes.CurrentFormat, 0, false},
 	}
 	for name, tc := range testcases {
 		tc := tc
@@ -1873,6 +1864,8 @@ func TestLoadSnapshotChunk(t *testing.T) {
 }
 
 func TestOfferSnapshot_Errors(t *testing.T) {
+	t.Skip("disabled pending MultiStore snapshot implementation")
+
 	// Set up app before test cases, since it's fairly expensive.
 	app, teardown := setupBaseAppWithSnapshots(t, 0, 0)
 	defer teardown()
@@ -1891,13 +1884,13 @@ func TestOfferSnapshot_Errors(t *testing.T) {
 			Height: 1, Format: 9, Chunks: 3, Hash: hash, Metadata: metadata,
 		}, abci.ResponseOfferSnapshot_REJECT_FORMAT},
 		"incorrect chunk count": {&abci.Snapshot{
-			Height: 1, Format: 1, Chunks: 2, Hash: hash, Metadata: metadata,
+			Height: 1, Format: snapshottypes.CurrentFormat, Chunks: 2, Hash: hash, Metadata: metadata,
 		}, abci.ResponseOfferSnapshot_REJECT},
 		"no chunks": {&abci.Snapshot{
-			Height: 1, Format: 1, Chunks: 0, Hash: hash, Metadata: metadata,
+			Height: 1, Format: snapshottypes.CurrentFormat, Chunks: 0, Hash: hash, Metadata: metadata,
 		}, abci.ResponseOfferSnapshot_REJECT},
 		"invalid metadata serialization": {&abci.Snapshot{
-			Height: 1, Format: 1, Chunks: 0, Hash: hash, Metadata: []byte{3, 1, 4},
+			Height: 1, Format: snapshottypes.CurrentFormat, Chunks: 0, Hash: hash, Metadata: []byte{3, 1, 4},
 		}, abci.ResponseOfferSnapshot_REJECT},
 	}
 	for name, tc := range testcases {
@@ -1929,6 +1922,8 @@ func TestOfferSnapshot_Errors(t *testing.T) {
 }
 
 func TestApplySnapshotChunk(t *testing.T) {
+	t.Skip("disabled pending MultiStore snapshot implementation")
+
 	source, teardown := setupBaseAppWithSnapshots(t, 4, 10)
 	defer teardown()
 
@@ -2013,7 +2008,7 @@ func TestWithRouter(t *testing.T) {
 		)
 		bapp.SetTxHandler(txHandler)
 	}
-	app := setupBaseApp(t, txHandlerOpt)
+	app := setupBaseApp(t, baseapp.AppOptionFunc(txHandlerOpt))
 	app.InitChain(abci.RequestInitChain{})
 
 	nBlocks := 3
@@ -2040,7 +2035,7 @@ func TestWithRouter(t *testing.T) {
 }
 
 func TestBaseApp_EndBlock(t *testing.T) {
-	db := dbm.NewMemDB()
+	db := memdb.NewDB()
 	name := t.Name()
 	logger := defaultLogger()
 
@@ -2051,7 +2046,7 @@ func TestBaseApp_EndBlock(t *testing.T) {
 	}
 
 	app := baseapp.NewBaseApp(name, logger, db)
-	app.SetParamStore(&paramStore{db: dbm.NewMemDB()})
+	app.SetParamStore(newParamStore(memdb.NewDB()))
 	app.InitChain(abci.RequestInitChain{
 		ConsensusParams: cp,
 	})

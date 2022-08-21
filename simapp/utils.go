@@ -6,9 +6,10 @@ import (
 	"os"
 
 	"github.com/tendermint/tendermint/libs/log"
-	dbm "github.com/tendermint/tm-db"
 
 	"github.com/cosmos/cosmos-sdk/codec"
+	dbm "github.com/cosmos/cosmos-sdk/db"
+	"github.com/cosmos/cosmos-sdk/db/badgerdb"
 	"github.com/cosmos/cosmos-sdk/simapp/helpers"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/kv"
@@ -19,7 +20,7 @@ import (
 // SetupSimulation creates the config, db (levelDB), temporary directory and logger for
 // the simulation tests. If `FlagEnabledValue` is false it skips the current test.
 // Returns error on an invalid db intantiation or temp dir creation.
-func SetupSimulation(dirPrefix, dbName string) (simtypes.Config, dbm.DB, string, log.Logger, bool, error) {
+func SetupSimulation(dirPrefix, dbName string) (simtypes.Config, dbm.DBConnection, string, log.Logger, bool, error) {
 	if !FlagEnabledValue {
 		return simtypes.Config{}, nil, "", nil, true, nil
 	}
@@ -39,7 +40,7 @@ func SetupSimulation(dirPrefix, dbName string) (simtypes.Config, dbm.DB, string,
 		return simtypes.Config{}, nil, "", nil, false, err
 	}
 
-	db, err := sdk.NewLevelDB(dbName, dir)
+	db, err := badgerdb.NewDB(dir)
 	if err != nil {
 		return simtypes.Config{}, nil, "", nil, false, err
 	}
@@ -104,10 +105,10 @@ func CheckExportSimulation(
 }
 
 // PrintStats prints the corresponding statistics from the app DB.
-func PrintStats(db dbm.DB) {
-	fmt.Println("\nLevelDB Stats")
-	fmt.Println(db.Stats()["leveldb.stats"])
-	fmt.Println("LevelDB cached block size", db.Stats()["leveldb.cachedblock"])
+// TODO: implement stats collection for DBConnection
+func PrintStats(db dbm.DBConnection) {
+	// stats := db.Stats()
+	fmt.Println("\nDB Stats: not available")
 }
 
 // GetSimulationLog unmarshals the KVPair's Value to the corresponding type based on the

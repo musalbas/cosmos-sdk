@@ -65,7 +65,7 @@ func (txh customTxHandler) runHandler(ctx context.Context, tx sdk.Tx, txBytes []
 		return sdkCtx, nil
 	}
 
-	ms := sdkCtx.MultiStore()
+	store := sdkCtx.MultiStore()
 
 	// Branch context before Handler call in case it aborts.
 	// This is required for both CheckTx and DeliverTx.
@@ -74,7 +74,7 @@ func (txh customTxHandler) runHandler(ctx context.Context, tx sdk.Tx, txBytes []
 	// NOTE: Alternatively, we could require that Handler ensures that
 	// writes do not happen if aborted/failed.  This may have some
 	// performance benefits, but it'll be more difficult to get right.
-	cacheCtx, msCache := cacheTxContext(sdkCtx, txBytes)
+	cacheCtx, storeCache := cacheTxContext(sdkCtx, txBytes)
 	cacheCtx = cacheCtx.WithEventManager(sdk.NewEventManager())
 	newCtx, err := txh.handler(cacheCtx, tx, isSimulate)
 	if err != nil {
@@ -88,10 +88,10 @@ func (txh customTxHandler) runHandler(ctx context.Context, tx sdk.Tx, txBytes []
 		// Also, in the case of the tx aborting, we need to track gas consumed via
 		// the instantiated gas meter in the Handler, so we update the context
 		// prior to returning.
-		sdkCtx = newCtx.WithMultiStore(ms)
+		sdkCtx = newCtx.WithMultiStore(store)
 	}
 
-	msCache.Write()
+	storeCache.Write()
 
 	return sdkCtx, nil
 }
@@ -99,18 +99,18 @@ func (txh customTxHandler) runHandler(ctx context.Context, tx sdk.Tx, txBytes []
 // cacheTxContext returns a new context based off of the provided context with
 // a branched multi-store.
 func cacheTxContext(sdkCtx sdk.Context, txBytes []byte) (sdk.Context, sdk.CacheMultiStore) {
-	ms := sdkCtx.MultiStore()
+	store := sdkCtx.MultiStore()
 	// TODO: https://github.com/cosmos/cosmos-sdk/issues/2824
-	msCache := ms.CacheMultiStore()
-	if msCache.TracingEnabled() {
-		msCache = msCache.SetTracingContext(
+	storeCache := store.CacheWrap()
+	if storeCache.TracingEnabled() {
+		storeCache.SetTracingContext(
 			sdk.TraceContext(
 				map[string]interface{}{
 					"txHash": fmt.Sprintf("%X", tmhash.Sum(txBytes)),
 				},
 			),
-		).(sdk.CacheMultiStore)
+		)
 	}
 
-	return sdkCtx.WithMultiStore(msCache), msCache
+	return sdkCtx.WithMultiStore(storeCache), storeCache
 }

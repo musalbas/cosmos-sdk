@@ -5,11 +5,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	dbm "github.com/cosmos/cosmos-sdk/db"
 )
 
 func Test_openDB(t *testing.T) {
 	t.Parallel()
-	_, err := openDB(t.TempDir())
+	_, err := openDB(t.TempDir(), dbm.BadgerDBBackend)
 	require.NoError(t, err)
 }
 

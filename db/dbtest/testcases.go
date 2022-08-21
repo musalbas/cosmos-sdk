@@ -140,19 +140,19 @@ func DoTestIterators(t *testing.T, load Loader) {
 	}
 	require.NoError(t, txn.Commit())
 
-	testRange := func(t *testing.T, iter dbm.Iterator, expected []string) {
-		i := 0
-		for ; iter.Next(); i++ {
-			expectedValue := expected[i]
-			value := iter.Value()
-			require.Equal(t, expectedValue, string(value), "i=%v", i)
-		}
-		require.Equal(t, len(expected), i)
-	}
-
 	type testCase struct {
 		start, end []byte
 		expected   []string
+	}
+	testRange := func(t *testing.T, iter dbm.Iterator, tc testCase) {
+		i := 0
+		for ; iter.Next(); i++ {
+			expectedValue := tc.expected[i]
+			value := iter.Value()
+			require.Equal(t, expectedValue, string(value),
+				"i=%v case=[[%x] [%x])", i, tc.start, tc.end)
+		}
+		require.Equal(t, len(tc.expected), i)
 	}
 
 	view := db.Reader()
@@ -165,11 +165,10 @@ func DoTestIterators(t *testing.T, load Loader) {
 		{[]byte{0x00, 0x01}, []byte{0x01}, []string{"0 1", "0 2"}},
 		{nil, []byte{0x01}, []string{"0", "0 0", "0 1", "0 2"}},
 	}
-	for i, tc := range iterCases {
-		t.Logf("Iterator case %d: [%v, %v)", i, tc.start, tc.end)
+	for _, tc := range iterCases {
 		it, err := view.Iterator(tc.start, tc.end)
 		require.NoError(t, err)
-		testRange(t, it, tc.expected)
+		testRange(t, it, tc)
 		it.Close()
 	}
 
@@ -181,11 +180,10 @@ func DoTestIterators(t *testing.T, load Loader) {
 		{[]byte{0x00, 0x01}, []byte{0x01}, []string{"0 2", "0 1"}},
 		{nil, []byte{0x01}, []string{"0 2", "0 1", "0 0", "0"}},
 	}
-	for i, tc := range reverseCases {
-		t.Logf("ReverseIterator case %d: [%v, %v)", i, tc.start, tc.end)
+	for _, tc := range reverseCases {
 		it, err := view.ReverseIterator(tc.start, tc.end)
 		require.NoError(t, err)
-		testRange(t, it, tc.expected)
+		testRange(t, it, tc)
 		it.Close()
 	}
 
@@ -414,6 +412,8 @@ func DoTestRevert(t *testing.T, load Loader, reload bool) {
 	}
 
 	initContents()
+	require.Error(t, db.RevertTo(0))  // RevertTo(0) is not allowed - user must use Revert()
+	require.Error(t, db.RevertTo(10)) // non-existent version
 	require.NoError(t, db.Revert())
 	view := db.Reader()
 	it, err := view.Iterator(nil, nil)
@@ -423,7 +423,7 @@ func DoTestRevert(t *testing.T, load Loader, reload bool) {
 	require.NoError(t, view.Discard())
 
 	initContents()
-	_, err = db.SaveNextVersion()
+	v1, err := db.SaveNextVersion()
 	require.NoError(t, err)
 
 	// get snapshot of db state
@@ -444,7 +444,7 @@ func DoTestRevert(t *testing.T, load Loader, reload bool) {
 		require.NoError(t, err)
 		for it.Next() {
 			val, has := state[string(it.Key())]
-			require.True(t, has, "key should not be present: %v => %v", it.Key(), it.Value())
+			require.True(t, has, "unexpected key: %v => %v", it.Key(), it.Value())
 			require.Equal(t, val, it.Value())
 			count++
 		}
@@ -465,48 +465,54 @@ func DoTestRevert(t *testing.T, load Loader, reload bool) {
 		txn = db.Writer()
 		require.NoError(t, txn.Set([]byte{3}, []byte{30}))
 		require.NoError(t, txn.Set([]byte{8}, []byte{8}))
-		require.NoError(t, txn.Delete([]byte{9}))
+		require.NoError(t, txn.Delete([]byte{9})) // redundant delete
 		require.NoError(t, txn.Commit())
 	}
 
 	changeContents()
 
-	if reload {
-		db.Close()
-		db = load(t, dirname)
+	cases := []func(dbm.DBConnection) error{
+		func(db dbm.DBConnection) error { return db.Revert() },
+		func(db dbm.DBConnection) error { return db.RevertTo(v1) },
 	}
+	for _, revertFunc := range cases {
+		if reload {
+			db.Close()
+			db = load(t, dirname)
+		}
 
-	txn = db.Writer()
-	require.Error(t, db.Revert()) // can't revert with open writers
-	txn.Discard()
-	require.NoError(t, db.Revert())
+		txn = db.Writer()
+		require.Error(t, revertFunc(db)) // can't revert with open writers
+		txn.Discard()
+		require.NoError(t, db.Revert())
 
-	if reload {
-		db.Close()
-		db = load(t, dirname)
+		if reload {
+			db.Close()
+			db = load(t, dirname)
+		}
+
+		checkContents()
+
+		// With intermediate versions added & deleted, revert again to v1
+		changeContents()
+		v2, _ := db.SaveNextVersion()
+
+		txn = db.Writer()
+		require.NoError(t, txn.Delete([]byte{6}))
+		require.NoError(t, txn.Set([]byte{8}, []byte{9}))
+		require.NoError(t, txn.Set([]byte{11}, []byte{11}))
+		txn.Commit()
+		v3, _ := db.SaveNextVersion()
+
+		txn = db.Writer()
+		require.NoError(t, txn.Set([]byte{12}, []byte{12}))
+		txn.Commit()
+
+		db.DeleteVersion(v2)
+		db.DeleteVersion(v3)
+		revertFunc(db)
+		checkContents()
 	}
-
-	checkContents()
-
-	// With intermediate versions added & deleted, revert again to v1
-	changeContents()
-	v2, _ := db.SaveNextVersion()
-
-	txn = db.Writer()
-	require.NoError(t, txn.Delete([]byte{6}))
-	require.NoError(t, txn.Set([]byte{8}, []byte{9}))
-	require.NoError(t, txn.Set([]byte{11}, []byte{11}))
-	txn.Commit()
-	v3, _ := db.SaveNextVersion()
-
-	txn = db.Writer()
-	require.NoError(t, txn.Set([]byte{12}, []byte{12}))
-	txn.Commit()
-
-	db.DeleteVersion(v2)
-	db.DeleteVersion(v3)
-	db.Revert()
-	checkContents()
 
 	require.NoError(t, db.Close())
 }
